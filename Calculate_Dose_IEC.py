@@ -38,6 +38,8 @@ parser.add_argument('-ref_dose','--input_path_ref_dose_file',type=str,help='path
 parser.add_argument('-ref_dose_mask','--ref_dose_mask_file',type=str,help='path towards the mask/labelled image for the reference dose image')
 parser.add_argument('-ref_dose_stat','--ref_dose_stat_file',type=str,help='path towards the Reference Dose simulation stat file in txt format')
 parser.add_argument('-auto_decay','--auto_decay',help='Include this option to automatically determine theoretical activity from Dicom info',action='store_true')
+parser.add_argument('-auto_scale','--auto_scale', help='Include this option to automatically rescale image to match theoretical activity', action='store_true')
+parser.add_argument('-auto_scale_region','--auto_scale_region', help='Choose the region overwhich the theoretical activity will be distributed (options: Phantom, Image).', type=str)
 parser.add_argument('-Th_Act_file','--theoretical_act_file',type=str,help='path to the csv file containing the theoretical activities in MBq (Include if auto_decay is off)')
 parser.add_argument('-o', '--output', type=str, help='Path to output folder')
 
@@ -510,13 +512,149 @@ class PetImage():
         shutil.rmtree(ref_dose_cylinder_folder_path)
         shutil.rmtree(ref_dose_full_phantom_folder_path)
         shutil.rmtree(cylinder_folder_path)
-        shutil.rmtree(full_phantom_folder_path)
+        # shutil.rmtree(full_phantom_folder_path)
 
     def rescale_PET_image(self):
         '''
         Method for rescaling PET image to match the real phantom activity
         :return:
         '''
+        #Automatically determine theoretical activity through a decay correction
+        if args.dicom_flag and args.auto_decay: #If autodecay option and Dicom flag are activated
+
+            print('\t\t Theoretical activity calculated automatically by radioactive decay')
+
+            for dcm_folder in os.listdir(args.PET_Image_folder):
+
+                if os.path.basename(dcm_folder)== os.path.basename(self.pet_image_file.rstrip('.mha')): #Check if the dicom folder name matches the current image
+
+                   dcm_files=os.listdir(os.path.join(args.PET_Image_folder,dcm_folder))
+
+                   #Read the first and last images in the dicom pile (This is because for multistep acquisition, the first image doesn't always correspond to the first step)
+                   first_dcm_file=pydicom.dcmread(os.path.join(args.PET_Image_folder,dcm_folder,dcm_files[0]))
+                   last_dcm_file=pydicom.dcmread(os.path.join(args.PET_Image_folder,dcm_folder,dcm_files[-1]))
+
+                   #Extract calibration information (Activity, Date and Time) => 0018,1074 & 0018,1078 tags
+                   A0=first_dcm_file[0x0054,0x0016][0][0x0018,0x1074].value #Initial phantom activity at calibration
+                   D0=first_dcm_file[0x0054,0x0016][0][0x0018,0x1078].value[:8] #Calibration date
+                   T0=first_dcm_file[0x0054,0x0016][0][0x0018,0x1078].value[8:14] #Calibration time
+
+                   #Extract acquisition date and time from the first and last slice of the dicom pile, only keep the smallest acquisition start time => 0008,002 & 0008,0032 tags
+                   D_first=first_dcm_file.AcquisitionDate # Acquisition date on the first image
+                   T_first=first_dcm_file.AcquisitionTime # Acquisition time on the first image
+
+                   D_last = last_dcm_file.AcquisitionDate  # Acquisition date on the last image
+                   T_last = last_dcm_file.AcquisitionTime  # Acquisition time on the last image
+
+                   #Create datetime objects | Format YYYY,MM,DD,HH,MM,SS
+                   calib_datetime=datetime(int(D0[0:4]),int(D0[4:6]),int(D0[6:8]),int(T0[0:2]),int(T0[2:4]),int(T0[4:6]))
+                   first_datetime=datetime(int(D_first[0:4]),int(D_first[4:6]),int(D_first[6:8]),int(T_first[0:2]),int(T_first[2:4]),int(T_first[4:6]))
+                   last_datetime = datetime(int(D_last[0:4]), int(D_last[4:6]), int(D_last[6:8]), int(T_last[0:2]),int(T_last[2:4]), int(T_last[4:6]))
+
+                   #Compare the two times and choose the earliest one. If they are equal (ex: 1 bed acquisition) chose either one for the future
+                   if first_datetime < last_datetime:
+                       acquisition_datetime=first_datetime
+
+                   elif first_datetime > last_datetime:
+                       acquisition_datetime=last_datetime
+
+                   elif first_datetime == last_datetime:
+                       acquisition_datetime = first_datetime
+
+                   # Calculate the time difference in seconds
+                   time_diff_sec=(acquisition_datetime - calib_datetime).total_seconds()
+
+                   #Calculate the theoretical activity in MBq at the acquisition start Date and Time
+                   lambda_phys = math.log(2) / self.radionuc_half_life_sec[self.radionuc]
+                   self.activity_MBq=(A0 * math.exp(-lambda_phys * time_diff_sec))/1e6
+
+
+        else: #Read theoretical activities from an input csv file
+            print('\t\t Reading theoretical activity from input file')
+            #Read the theoretical activity input file
+            df_th_act=pd.read_csv(args.theoretical_act_file)
+            # Extract the activity corresponding to the acquisition date
+            self.activity_MBq = df_th_act[df_th_act.iloc[:, 0] == self.acq_tag].iloc[0, 1]
+
+
+        if args.auto_scale_region=='Phantom':
+            self.image_folder=os.path.join(args.output,'rescaled_PET_phantom_distribution')
+        elif args.auto_scale_region=='Image':
+            self.image_folder=os.path.join(args.output,'rescaled_PET_image_distribution')
+
+        if not os.path.exists(self.image_folder):
+            os.makedirs(self.image_folder)
+
+        #Load PET image
+        pet_img=sitk.ReadImage(self.pet_image_file)
+        #Extract image information
+        pet_img_origin = pet_img.GetOrigin()
+        pet_img_spacing = pet_img.GetSpacing()
+        pet_img_direction = pet_img.GetDirection()
+
+        # Extract pixel volume
+        pxl_vol = pet_img.GetSpacing()[0] * pet_img.GetSpacing()[1] * pet_img.GetSpacing()[2]
+
+        #Convert to array
+        pet_img_arr=sitk.GetArrayFromImage(pet_img)
+
+        # Convert concentration values to activity A= C*(V/1000)
+        pet_img_act_arr = pet_img_arr * (pxl_vol / 1000)
+
+        # Filter image with mask to extract the activity in the region of interest (if phantom is selected)
+        if args.auto_scale_region=='Phantom':
+            label_image_file=os.path.join(args.output, 'Binary_images', 'PET_Full_phantom','WholePhantom_PET.mha')
+            label_img = sitk.ReadImage(label_image_file)
+            label_img_arr = sitk.GetArrayFromImage(label_img)
+
+            # Filter image with mask 
+            pet_img_act_arr = pet_img_act_arr * label_img_arr
+        
+
+        # Calculate the total activity in the image or phantom
+        self.A_image_MBq = np.sum(pet_img_act_arr)/1e6
+
+        # Calculate scaling factor
+        scaling_factor=self.activity_MBq/self.A_image_MBq
+
+        print(f'\t\t Theoretical activity for current timepoint = {self.activity_MBq} MBq')
+
+        if args.auto_scale_region=='Phantom':
+            print(f'\t\t Quantified phantom activity for current timepoint = {self.A_image_MBq} MBq')
+        elif args.auto_scale_region=='Image':
+            print(f'\t\t Quantified image activity for current timepoint = {self.A_image_MBq} MBq')
+
+        print('\t\t Applied scaling factor: ', scaling_factor)
+
+        # Apply scaling factor to image
+        pet_img_act_arr = pet_img_act_arr * scaling_factor
+
+        #Revert back to a concentration map
+
+        rescaled_pet_img_arr = pet_img_act_arr *(1000/pxl_vol)
+
+        # Convert back to image
+
+        rescaled_pet_img=sitk.GetImageFromArray(rescaled_pet_img_arr)
+
+        # Set the origin, spacing, and direction of the image to match those of original image
+        rescaled_pet_img.SetOrigin(pet_img_origin)
+        rescaled_pet_img.SetSpacing(pet_img_spacing)
+        rescaled_pet_img.SetDirection(pet_img_direction)
+
+        # Export rescaled image to output folder
+        filename=os.path.splitext(os.path.basename(self.pet_image_file))[0]
+
+        if args.auto_scale_region=='Phantom':
+            self.pet_image_file=os.path.join(self.image_folder,filename+f'Phantom_rescaled_{filename}.mha')
+            print('\t\tRescaled image saved: ',self.pet_image_file)
+        elif args.auto_scale_region=='Image':
+            self.pet_image_file=os.path.join(self.image_folder,filename+f'WholeImage_rescaled_{filename}.mha')
+            print('\t\tRescaled image saved: ',self.pet_image_file)
+
+        sitk.WriteImage(rescaled_pet_img,  self.pet_image_file)
+
+        shutil.rmtree(os.path.join(args.output, 'Binary_images', 'PET_Full_phantom'))
 
     def generate_CumAct(self):
         '''
@@ -730,7 +868,7 @@ class PetImage():
             #Read the theoretical activity input file
             df_th_act=pd.read_csv(args.theoretical_act_file)
             # Extract the activity corresponding to the acquisition date
-            self.activity_MBq = df_th_act[df_th_act.iloc[:, 0] == float(self.acq_tag)].iloc[0, 1]
+            self.activity_MBq = df_th_act[df_th_act.iloc[:, 0] == self.acq_tag].iloc[0, 1]
 
         #Calculate the corresponding cumulative activity
         lambda_phys = math.log(2) / self.radionuc_half_life_sec[self.radionuc]
@@ -1175,34 +1313,43 @@ def main():
         print('\n\tCreating Binary Masks')
         image_object.binarize_image()
 
-        #Step 4: Convert Concentration image to cumulative activity
+        # Step 4: Rescale image to theoretical activity (if requested)
+        if args.auto_scale:
+            if args.auto_scale_region == 'Phantom':
+                print('\n\t Rescaling PET image  within the phantom region')
+            if args.auto_scale_region == 'Image':
+                print('\n\t Rescaling PET image within the whole image')
+            
+            image_object.rescale_PET_image()
+
+        #Step 5: Convert Concentration image to cumulative activity
         image_object.generate_CumAct()
 
-        # Step 5: Calculate dose by LDM
+        # Step 6: Calculate dose by LDM
         print('\n\tCalculating LDM Dose map')
         image_object.calculate_LDM_dosemap()
 
-        # Step 6: Calculate dose by DVK
+        # Step 7: Calculate dose by DVK
         print('\n\tCalculating DVK Dose map')
         image_object.calculate_DVK_dosemap()
 
-        # Step 7: Extract reference dose map
+        # Step 8: Extract reference dose map
         print('\n\tGenerating reference dose map')
         image_object.generate_ref_dosemap()
         #
-        # Step 8: Extract DVH
+        # Step 9: Extract DVH
         print('\n\tExtracting DVH curve data')
         image_object.generate_DVH()
         #
-        # Step 9: Plot cumulative DVH curve
+        # Step 10: Plot cumulative DVH curve
         print('\n\tPlotting DVH curves')
         image_object.plot_DVH()
 
-        # Step 10: Calculate inverse DVH
+        # Step 11: Calculate inverse DVH
         print('\n\tCalculating inverse DVH')
         image_object.calculate_rmse()
 
-        # Step 11: Update RMSE dataframes
+        # Step 12: Update RMSE dataframes
         print('\n\tUpdating RMSE table... ')
         df_nrmse_LDM=pd.concat([df_nrmse_LDM,pd.DataFrame([image_object.nrmse_LDM])])
         df_nrmse_DVK=pd.concat([df_nrmse_DVK,pd.DataFrame([image_object.nrmse_DVK])])
